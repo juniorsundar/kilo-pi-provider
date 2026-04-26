@@ -244,6 +244,38 @@ function isFreeModel(m: OpenRouterModel): boolean {
   return false;
 }
 
+type KiloReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+type KiloModelCompat = {
+  cacheControlFormat?: "anthropic";
+  requiresReasoningContentOnAssistantMessages?: boolean;
+  reasoningEffortMap?: Partial<Record<KiloReasoningLevel, string>>;
+};
+
+function getKiloModelCompat(
+  m: OpenRouterModel,
+): ProviderModelConfig["compat"] | undefined {
+  const compat: KiloModelCompat = {};
+
+  // Kilo's gateway is OpenRouter-compatible, but it uses api.kilo.ai so
+  // pi-ai's URL/provider auto-detection cannot infer OpenRouter model quirks.
+  if (m.id.startsWith("anthropic/")) {
+    compat.cacheControlFormat = "anthropic";
+  }
+
+  if (m.id === "deepseek/deepseek-v4-flash" || m.id === "deepseek/deepseek-v4-pro") {
+    compat.requiresReasoningContentOnAssistantMessages = true;
+  }
+
+  if (m.id === "deepseek/deepseek-v4-pro") {
+    compat.reasoningEffortMap = { xhigh: "max" };
+  }
+
+  return Object.keys(compat).length > 0
+    ? (compat as ProviderModelConfig["compat"])
+    : undefined;
+}
+
 function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
   const inputModalities = m.architecture?.input_modalities ?? ["text"];
   const supportsImages = inputModalities.includes("image");
@@ -267,6 +299,7 @@ function mapOpenRouterModel(m: OpenRouterModel): ProviderModelConfig {
     },
     contextWindow: m.context_length,
     maxTokens: maxTokens,
+    compat: getKiloModelCompat(m),
   };
 }
 
@@ -381,6 +414,7 @@ export default async function (pi: ExtensionAPI) {
           cost: m.cost,
           contextWindow: m.contextWindow,
           maxTokens: m.maxTokens,
+          compat: m.compat,
         }));
         return [...nonKilo, ...fullModels];
       },
@@ -507,7 +541,7 @@ export default async function (pi: ExtensionAPI) {
       message: {
         customType: "kilo",
         content: `By using Kilo, you agree to the Terms of Service: ${KILO_TOS_URL}`,
-        display: "inline",
+        display: true,
       },
     };
   });

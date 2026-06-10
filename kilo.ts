@@ -250,12 +250,19 @@ type KiloModelCompat = {
   cacheControlFormat?: "anthropic";
   requiresReasoningContentOnAssistantMessages?: boolean;
   reasoningEffortMap?: Partial<Record<KiloReasoningLevel, string>>;
+  supportsDeveloperRole?: boolean;
 };
 
 function getKiloModelCompat(
   m: OpenRouterModel,
 ): ProviderModelConfig["compat"] | undefined {
-  const compat: KiloModelCompat = {};
+  // Kilo's gateway rejects the `developer` role with HTTP 400; pi-ai's
+  // openai-completions driver emits it for the system prompt whenever
+  // `model.reasoning && compat.supportsDeveloperRole`. Force the legacy
+  // `system` role for every model going through the Kilo gateway.
+  const compat: KiloModelCompat = {
+    supportsDeveloperRole: false,
+  };
 
   // Kilo's gateway is OpenRouter-compatible, but it uses api.kilo.ai so
   // pi-ai's URL/provider auto-detection cannot infer OpenRouter model quirks.

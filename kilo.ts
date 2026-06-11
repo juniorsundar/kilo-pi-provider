@@ -9,6 +9,8 @@
  *   # Then /login kilo, or set KILO_API_KEY=...
  */
 
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import type {
   Api,
   Model,
@@ -365,11 +367,41 @@ const KILO_PROVIDER_CONFIG = {
 };
 
 // =============================================================================
+// Stored Credential Lookup
+// =============================================================================
+
+async function getStoredKiloToken(): Promise<string | undefined> {
+  const home = homedir();
+  const authPaths = [
+    `${home}/.pi/agent/auth.json`,
+    `${process.cwd()}/.pi/agent/auth.json`,
+  ];
+  for (const authPath of authPaths) {
+    try {
+      const content = await readFile(authPath, "utf-8");
+      const auth = JSON.parse(content);
+      const kiloAuth = auth.kilo;
+      if (
+        kiloAuth?.type === "oauth" &&
+        typeof kiloAuth.access === "string" &&
+        (typeof kiloAuth.expires !== "number" || kiloAuth.expires > Date.now())
+      ) {
+        return kiloAuth.access;
+      }
+    } catch {
+      // File missing or unreadable — try next path
+    }
+  }
+  return undefined;
+}
+
+// =============================================================================
 // Extension Entry Point
 // =============================================================================
 
 export default async function (pi: ExtensionAPI) {
-  // Fetch free models at load time so the provider is immediately usable.
+  // Baseline free models — always free-only so that after logout
+  // modelRegistry.refresh() rebuilds from these and drops paid models.
   let freeModels: ProviderModelConfig[] = [];
   try {
     freeModels = await fetchKiloModels({ freeOnly: true });
@@ -383,6 +415,24 @@ export default async function (pi: ExtensionAPI) {
   // Full model list cached after login or session_start (when already logged in).
   // Used by modifyModels to upgrade the free list without an async fetch.
   let cachedAllModels: ProviderModelConfig[] = [];
+
+  // When the user is already logged into Kilo, pre-fetch the full model list
+  // so that enabledModels patterns in settings.json (including paid models like
+  // kilo/minimax/…) resolve immediately at startup instead of waiting for
+  // session_start.
+  let initialAllModels: ProviderModelConfig[] | undefined;
+  try {
+    const storedToken = await getStoredKiloToken();
+    if (storedToken) {
+      initialAllModels = await fetchKiloModels({ token: storedToken });
+      cachedAllModels = initialAllModels;
+    }
+  } catch (error) {
+    console.warn(
+      "[kilo] Failed to pre-fetch full model list at startup:",
+      error instanceof Error ? error.message : error,
+    );
+  }
 
   function makeOAuthConfig() {
     return {
@@ -428,11 +478,12 @@ export default async function (pi: ExtensionAPI) {
     };
   }
 
-  // Always register with free models. modifyModels upgrades to full list
-  // when credentials exist, and naturally falls back after logout.
+  // Register with full model list when already logged in (so enabledModels
+  // patterns resolve at startup), free-only otherwise.  modifyModels upgrades
+  // on session_start and naturally falls back after logout.
   pi.registerProvider("kilo", {
     ...KILO_PROVIDER_CONFIG,
-    models: freeModels,
+    models: initialAllModels ?? freeModels,
     oauth: makeOAuthConfig(),
   });
 

@@ -9,8 +9,9 @@
  *   # Then /login kilo, or set KILO_API_KEY=...
  */
 
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   Api,
   Model,
@@ -32,6 +33,63 @@ const MODELS_FETCH_TIMEOUT_MS = 10_000;
 const TOKEN_EXPIRATION_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
 const KILO_TOS_URL = "https://kilo.ai/terms";
 const KILO_PROFILE_ENDPOINT = `${KILO_API_BASE}/api/profile`;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// =============================================================================
+// Model Cache
+// =============================================================================
+
+interface ModelCache {
+  updatedAt: string;
+  freeModels: ProviderModelConfig[];
+  allModels?: ProviderModelConfig[];
+}
+
+async function loadModelCache(): Promise<ModelCache | null> {
+  try {
+    const cachePath = join(homedir(), ".pi", "agent", "kilo-model-cache.json");
+    const raw = await readFile(cachePath, "utf-8");
+    const data = JSON.parse(raw) as ModelCache;
+    const updatedAt = new Date(data.updatedAt).getTime();
+    if (isNaN(updatedAt) || Date.now() - updatedAt > CACHE_TTL_MS) {
+      console.log("[kilo] Model cache expired or invalid");
+      return null;
+    }
+    if (!Array.isArray(data.freeModels)) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+async function saveModelCache(
+  freeModels: ProviderModelConfig[],
+  allModels?: ProviderModelConfig[],
+): Promise<void> {
+  try {
+    const cacheDir = join(homedir(), ".pi", "agent");
+    await mkdir(cacheDir, { recursive: true });
+    const cachePath = join(cacheDir, "kilo-model-cache.json");
+    await writeFile(
+      cachePath,
+      JSON.stringify(
+        {
+          updatedAt: new Date().toISOString(),
+          freeModels,
+          allModels: allModels ?? null,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  } catch (error) {
+    console.warn(
+      "[kilo] Failed to write model cache:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+}
 
 // =============================================================================
 // Balance Fetching
@@ -403,14 +461,6 @@ export default async function (pi: ExtensionAPI) {
   // Baseline free models — always free-only so that after logout
   // modelRegistry.refresh() rebuilds from these and drops paid models.
   let freeModels: ProviderModelConfig[] = [];
-  try {
-    freeModels = await fetchKiloModels({ freeOnly: true });
-  } catch (error) {
-    console.warn(
-      "[kilo] Failed to fetch free models at startup:",
-      error instanceof Error ? error.message : error,
-    );
-  }
 
   // Full model list cached after login or session_start (when already logged in).
   // Used by modifyModels to upgrade the free list without an async fetch.
@@ -421,16 +471,50 @@ export default async function (pi: ExtensionAPI) {
   // kilo/minimax/…) resolve immediately at startup instead of waiting for
   // session_start.
   let initialAllModels: ProviderModelConfig[] | undefined;
-  try {
+
+  // Try disk cache first — avoids 10-20s network fetch on every startup
+  const cache = await loadModelCache();
+  if (cache) {
+    console.log(
+      "[kilo] Using cached model list from",
+      new Date(cache.updatedAt).toLocaleString(),
+    );
+    freeModels = cache.freeModels;
     const storedToken = await getStoredKiloToken();
-    if (storedToken) {
-      initialAllModels = await fetchKiloModels({ token: storedToken });
-      cachedAllModels = initialAllModels;
+    if (storedToken && cache.allModels) {
+      initialAllModels = cache.allModels;
+      cachedAllModels = cache.allModels;
     }
-  } catch (error) {
-    console.warn(
-      "[kilo] Failed to pre-fetch full model list at startup:",
-      error instanceof Error ? error.message : error,
+  } else {
+    // Cache miss — fetch from API
+    try {
+      freeModels = await fetchKiloModels({ freeOnly: true });
+    } catch (error) {
+      console.warn(
+        "[kilo] Failed to fetch free models at startup:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+
+    try {
+      const storedToken = await getStoredKiloToken();
+      if (storedToken) {
+        initialAllModels = await fetchKiloModels({ token: storedToken });
+        cachedAllModels = initialAllModels;
+      }
+    } catch (error) {
+      console.warn(
+        "[kilo] Failed to pre-fetch full model list at startup:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+
+    // Save to disk cache for next startup
+    saveModelCache(freeModels, cachedAllModels).catch((err) =>
+      console.warn(
+        "[kilo] Failed to save model cache:",
+        err instanceof Error ? err.message : err,
+      ),
     );
   }
 
@@ -443,6 +527,12 @@ export default async function (pi: ExtensionAPI) {
         // modelRegistry.refresh() that runs right after login returns.
         try {
           cachedAllModels = await fetchKiloModels({ token: cred.access });
+          saveModelCache(freeModels, cachedAllModels).catch((err) =>
+            console.warn(
+              "[kilo] Failed to save model cache after login:",
+              err instanceof Error ? err.message : err,
+            ),
+          );
         } catch (error) {
           console.warn(
             "[kilo] Failed to fetch models after login:",
@@ -500,6 +590,12 @@ export default async function (pi: ExtensionAPI) {
 
     try {
       cachedAllModels = await fetchKiloModels({ token: cred.access });
+      saveModelCache(freeModels, cachedAllModels).catch((err) =>
+        console.warn(
+          "[kilo] Failed to save model cache:",
+          err instanceof Error ? err.message : err,
+        ),
+      );
     } catch (error) {
       console.warn(
         "[kilo] Failed to fetch models at session start:",
@@ -749,5 +845,41 @@ export default async function (pi: ExtensionAPI) {
         },
       };
     });
+  });
+
+  // Command: rebuild the disk cache with fresh model data
+  pi.registerCommand("kilo-rebuild-cache", {
+    description: "Rebuild cached Kilo model list from API",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify("Fetching Kilo models from API...", "info");
+      try {
+        const freshFree = await fetchKiloModels({ freeOnly: true });
+        freeModels = freshFree;
+
+        const cred = ctx.modelRegistry.authStorage.get("kilo");
+        if (cred?.type === "oauth" && cred.access) {
+          cachedAllModels = await fetchKiloModels({ token: cred.access });
+        }
+
+        saveModelCache(freeModels, cachedAllModels).catch((err) =>
+          console.warn(
+            "[kilo] Rebuild-cache save failed:",
+            err instanceof Error ? err.message : err,
+          ),
+        );
+
+        const count =
+          cred?.type === "oauth" ? cachedAllModels.length : freshFree.length;
+        ctx.ui.notify(
+          `Kilo model cache rebuilt (${count} models)`,
+          "success",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          `Failed to rebuild cache: ${error instanceof Error ? error.message : error}`,
+          "error",
+        );
+      }
+    },
   });
 }
